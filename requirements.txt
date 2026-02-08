@@ -1,0 +1,14 @@
+# Banco de Dados
+oracledb
+pymongo
+
+# IA e Orquestração
+langchain
+langchain-mongodb
+langgraph
+langchain-openai
+langchain-community
+langchainhub
+
+# Utilitários
+python-dotenv
