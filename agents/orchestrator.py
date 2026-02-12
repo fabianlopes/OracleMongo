@@ -5,54 +5,57 @@ from langchain_ollama import ChatOllama
 from langchain.agents.agent import AgentExecutor
 from langchain.agents.react.agent import create_react_agent
 from langchain.prompts import PromptTemplate
-from langchain import hub
 
-# Ajuste de Path para reconhecimento do pacote
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Garante que o pacote 'agents' seja reconhecido
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from agents.tools import (
     listar_demandas_atuais,
     buscar_detalhes_subticket,
     estatisticas_por_realizador,
-    identificar_demandas_duplicadas,
-    gerar_relatorio_envelhecimento
+    executar_diagnostico_pmo_real,
+    gerar_relatorio_envelhecimento,
+    busca_avancada_texto
 )
 
 load_dotenv()
 
 def iniciar_orquestrador():
-    llm = ChatOllama(model="llama3.1", temperature=0)
+    llm = ChatOllama(
+        model="llama3.1",
+        temperature=0,
+        stop=["Observation:", "Observation", "\nObservation:"] # Força a parada para o sistema injetar o dado real
+    )
 
     tools = [
         listar_demandas_atuais,
         buscar_detalhes_subticket,
         estatisticas_por_realizador,
-        identificar_demandas_duplicadas,
-        gerar_relatorio_envelhecimento
+        executar_diagnostico_pmo_real,
+        gerar_relatorio_envelhecimento,
+        busca_avancada_texto
     ]
 
-    # Ajuste no template para proibir a tradução dos nomes das ferramentas
+    # ... (mantenha os imports)
+
     template = """Você é o PMO Virtual da SEMEF. 
-    
-    REGRAS CRÍTICAS:
-    - No campo 'Action', você DEVE usar EXATAMENTE o nome da função Python, sem traduzir.
-    - Use apenas um dos nomes: [{tool_names}].
-    - No campo 'Action Input', use apenas 'None' ou o ID solicitado.
+    Responda apenas com base nos dados retornados pelas ferramentas.
 
-    Ferramentas:
-    {tools}
+    Nomes das ferramentas: {tool_names}
+    Descrições: {tools}
 
-    Formato:
-    Question: {input}
-    Thought: [seu raciocínio]
-    Action: [nome_tecnico_da_ferramenta]
-    Action Input: [valor ou None]
-    Observation: [resultado]
+    Siga este formato estritamente:
+    Question: a pergunta do usuário
+    Thought: descreva em uma frase o que você vai buscar.
+    Action: o nome da ferramenta (deve ser um de [{tool_names}])
+    Action Input: o parâmetro ou None
+    Observation: o resultado da ferramenta
     ... (repetir se necessário)
-    Thought: Eu sei a resposta final
-    Final Answer: [sua resposta em português]
+    Thought: Agora eu tenho a resposta.
+    Final Answer: o relatório final em português.
 
-    {agent_scratchpad}"""
+    Question: {input}
+    Thought: {agent_scratchpad}"""
 
     prompt = PromptTemplate.from_template(template)
     agent = create_react_agent(llm, tools, prompt)
@@ -62,20 +65,18 @@ def iniciar_orquestrador():
         tools=tools,
         verbose=True,
         handle_parsing_errors=True,
-        max_iterations=5,
-        # Alterado para 'force' que é o padrão mais estável para evitar erros de gerador
+        max_iterations=3, # Reduzido para evitar loops longos
         early_stopping_method="force"
     )
 
 if __name__ == "__main__":
     pmo = iniciar_orquestrador()
-    print("🤖 PMO Virtual pronto. Digite 'sair' para encerrar.")
+    print("🚀 PMO Virtual SEMEF Ativo. Digite 'sair' para encerrar.")
 
     while True:
-        pergunta = input("\n📝 Digite sua consulta de gestão: ")
+        pergunta = input("\n📝 Consulta: ")
         if pergunta.lower() in ['sair', 'exit', 'quit']:
             break
-
         try:
             pmo.invoke({"input": pergunta})
         except Exception as e:

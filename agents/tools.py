@@ -6,136 +6,90 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import dns.resolver
+
 def get_collection():
-    client = MongoClient(os.getenv("MONGO_URI"))
+    # Força um tempo de resposta menor para o DNS não travar o Agente
+    client = MongoClient(
+        os.getenv("MONGO_URI"),
+        serverSelectionTimeoutMS=5000, # 5 segundos de limite para achar o servidor
+        connectTimeoutMS=5000
+    )
     return client['citsm_analyzer']['ods_itsm']
 
 @tool
-def listar_demandas_atuais(observacao: str = None):
+def executar_diagnostico_pmo_real(dummy: str = None):
+    """Executa a pipeline de agregação focando apenas em demandas ATIVAS."""
+    col = get_collection()
+    pipeline = [
+        # FILTRO CRÍTICO: Remove o que já foi cancelado ou fechado
+        {"$match": {"STATUS": {"$nin": ["Cancelado", "Fechado", "Concluído"]}}},
+        {"$facet": {
+            "mais_antigos": [
+                {"$sort": {"DTABERTURA": 1}},
+                {"$limit": 5},
+                {"$project": {"TICKET": "$TICKET_SUBTICKET", "TECNICO": "$TECNICORESPONSAVEL", "DATA": "$DTABERTURA", "STATUS": 1}}
+            ],
+            "duplicados": [
+                {"$match": {"RESUMO_TICKET": {"$ne": None}}}, # Ignora resumos nulos
+                {"$group": {"_id": "$RESUMO_TICKET", "qtd": {"$sum": 1}, "ids": {"$push": "$TICKET_SUBTICKET"}}},
+                {"$match": {"qtd": {"$gt": 1}}},
+                {"$sort": {"qtd": -1}},
+                {"$limit": 5}
+            ]
+        }}
+    ]
+    res = list(col.aggregate(pipeline))[0]
+    return f"DADOS REAIS (FILTRADOS POR ATIVOS): {str(res)}"
+
+@tool
+def busca_avancada_texto(termo: str):
     """
-    Lista as demandas em aberto ou andamento criadas a partir de 2025.
-    Foca no TICKET_SUBTICKET como identificador principal.
+    Realiza uma busca por texto nos campos RESUMO_TICKET e SISTEMA.
+    Útil para encontrar dados reais sobre um assunto específico.
     """
     col = get_collection()
-    data_limite = datetime(2025, 1, 1)
-
     query = {
-        "STATUS": {"$ne": "Fechado"},
-        "ia_analysis_ready.dt_abertura_iso": {"$gte": data_limite}
+        "$or": [
+            {"RESUMO_TICKET": {"$regex": termo, "$options": "i"}},
+            {"SISTEMA": {"$regex": termo, "$options": "i"}}
+        ],
+        "ia_analysis_ready.dt_abertura_iso": {"$gte": datetime(2025, 1, 1)}
     }
+    return list(col.find(query).limit(20))
 
-    resultados = list(col.find(query).sort("ia_analysis_ready.dt_abertura_iso", -1).limit(15))
-
-    if not resultados:
-        return "Nenhuma demanda ativa encontrada de 2025 em diante."
-
-    return [
-        {
-            "subticket": r.get("TICKET_SUBTICKET"),
-            "sistema": r.get("SISTEMA"),
-            "status": r.get("STATUS"),
-            "resumo": r.get("RESUMO_TICKET")[:80] if r.get("RESUMO_TICKET") else "Sem resumo"
-        } for r in resultados
-    ]
+@tool
+def listar_demandas_atuais(observacao: str = None):
+    """Lista demandas em aberto criadas a partir de 2025."""
+    col = get_collection()
+    query = {"STATUS": {"$ne": "Fechado"}, "ia_analysis_ready.dt_abertura_iso": {"$gte": datetime(2025, 1, 1)}}
+    return list(col.find(query).sort("ia_analysis_ready.dt_abertura_iso", -1).limit(15))
 
 @tool
 def buscar_detalhes_subticket(subticket_id: str):
-    """
-    Busca a descrição completa e o status de um Subticket específico através do seu ID.
-    """
+    """Busca detalhes de um Subticket específico pelo ID."""
     col = get_collection()
-    res = col.find_one({"TICKET_SUBTICKET": str(subticket_id)})
-
-    if not res:
-        return f"Subticket {subticket_id} não encontrado."
-
-    return {
-        "subticket": res.get("TICKET_SUBTICKET"),
-        "descricao": res.get("DESCRICAO"),
-        "status": res.get("STATUS"),
-        "tecnico": res.get("TECNICORESPONSAVEL"),
-        "abertura": res.get("ia_analysis_ready", {}).get("dt_abertura_iso")
-    }
+    return col.find_one({"TICKET_SUBTICKET": str(subticket_id)})
 
 @tool
 def estatisticas_por_realizador(dummy: str = None):
-    """
-    Retorna o ranking de técnicos (TECNICORESPONSAVEL) com mais demandas em aberto em 2025/2026.
-    """
+    """Ranking de técnicos com mais demandas em aberto em 2025/2026."""
     col = get_collection()
-    data_limite = datetime(2025, 1, 1)
-
     pipeline = [
-        {"$match": {
-            "STATUS": {"$ne": "Fechado"},
-            "ia_analysis_ready.dt_abertura_iso": {"$gte": data_limite}
-        }},
+        {"$match": {"STATUS": {"$ne": "Fechado"}, "ia_analysis_ready.dt_abertura_iso": {"$gte": datetime(2025, 1, 1)}}},
         {"$group": {"_id": "$TECNICORESPONSAVEL", "total": {"$sum": 1}}},
         {"$sort": {"total": -1}}
     ]
     return list(col.aggregate(pipeline))
 
 @tool
-def identificar_demandas_duplicadas(termo: str = None):
-    """
-    Analisa a base de dados em busca de subtickets com resumos muito similares que podem ser duplicatas.
-    """
+def gerar_relatorio_envelhecimento(dias_minimos: int = 10):
+    """Calcula o aging das demandas não finalizadas de 2025/2026."""
     col = get_collection()
     pipeline = [
-        {"$match": {"STATUS": {"$ne": "Fechado"}}},
-        {"$group": {
-            "_id": "$RESUMO_TICKET",
-            "ocorrencias": {"$sum": 1},
-            "subtickets": {"$push": "$TICKET_SUBTICKET"}
-        }},
-        {"$match": {"ocorrencias": {"$gt": 1}}},
-        {"$limit": 5}
+        {"$match": {"STATUS": {"$ne": "Fechado"}, "ia_analysis_ready.dt_abertura_iso": {"$gte": datetime(2025, 1, 1)}}},
+        {"$addFields": {"dias_de_vida": {"$dateDiff": {"startDate": "$ia_analysis_ready.dt_abertura_iso", "endDate": datetime.utcnow(), "unit": "day"}}}},
+        {"$match": {"dias_de_vida": {"$gte": dias_minimos}}},
+        {"$sort": {"dias_de_vida": -1}}
     ]
     return list(col.aggregate(pipeline))
-
-@tool
-def gerar_relatorio_envelhecimento(dias_minimos: int = 10):
-    """
-    Calcula há quantos dias as demandas de 2025/2026 estão abertas e não finalizadas.
-    Retorna os subtickets que excederam o limite de dias informado (padrão 10 dias).
-    """
-    col = get_collection()
-    hoje = datetime.utcnow()
-    data_limite = datetime(2025, 1, 1)
-
-    pipeline = [
-        # Filtro inicial: Apenas 2025+, Status não finalizado e que tenha data ISO
-        {"$match": {
-            "STATUS": {"$ne": "Fechado"},
-            "ia_analysis_ready.dt_abertura_iso": {"$gte": data_limite}
-        }},
-        # Cálculo da diferença de dias
-        {"$addFields": {
-            "dias_de_vida": {
-                "$dateDiff": {
-                    "startDate": "$ia_analysis_ready.dt_abertura_iso",
-                    "endDate": hoje,
-                    "unit": "day"
-                }
-            }
-        }},
-        # Filtro de envelhecimento
-        {"$match": {"dias_de_vida": {"$gte": dias_minimos}}},
-        # Projeção do que é importante para o gestor
-        {"$project": {
-            "subticket": "$TICKET_SUBTICKET",
-            "sistema": "$SISTEMA",
-            "status": "$STATUS",
-            "tecnico": "$TECNICORESPONSAVEL",
-            "dias_aberto": "$dias_de_vida"
-        }},
-        {"$sort": {"dias_aberto": -1}}
-    ]
-
-    resultados = list(col.aggregate(pipeline))
-
-    if not resultados:
-        return f"Nenhuma demanda ativa com mais de {dias_minimos} dias de atraso."
-
-    return resultados
-
